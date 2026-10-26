@@ -166,7 +166,9 @@ export const Sidebar = ({
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.74rem' }}>
                   <span style={{ color: 'var(--text-secondary)' }}>Gemini Embeddings</span>
-                  {systemStatus?.has_google_key ? (
+                  {systemStatus === null ? (
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.72rem' }}>Checking...</span>
+                  ) : systemStatus?.has_google_key ? (
                     <span style={{ color: 'var(--status-success)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                       <CheckCircle2 size={12} /> Active
                     </span>
@@ -179,7 +181,9 @@ export const Sidebar = ({
 
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.74rem' }}>
                   <span style={{ color: 'var(--text-secondary)' }}>Groq LLM</span>
-                  {systemStatus?.has_groq_key ? (
+                  {systemStatus === null ? (
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.72rem' }}>Checking...</span>
+                  ) : systemStatus?.has_groq_key ? (
                     <span style={{ color: 'var(--status-success)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                       <CheckCircle2 size={12} /> Active
                     </span>

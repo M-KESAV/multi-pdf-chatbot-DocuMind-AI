@@ -102,7 +102,12 @@ export const Header = ({
         )}
 
         {/* Backend Status Pill */}
-        {hasKeys ? (
+        {systemStatus === null ? (
+          <div className="status-pill warning" title="Connecting to DocuMind backend...">
+            <span className="status-dot"></span>
+            <span>Connecting...</span>
+          </div>
+        ) : hasKeys ? (
           isReady ? (
             <div className="status-pill ready" title="Vector store indexed and live">
               <span className="status-dot"></span>

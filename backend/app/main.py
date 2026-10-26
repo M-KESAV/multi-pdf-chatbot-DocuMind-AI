@@ -37,8 +37,14 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Parse configured CORS origins
-raw_origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+# Parse and normalize configured CORS origins (strip whitespace and trailing slashes)
+raw_origins = [o.strip().rstrip("/") for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+
+# Guarantee the production Vercel frontend is always in allowed origins
+production_frontend = "https://multi-pdf-chatbot-docu-mind-ai.vercel.app"
+if production_frontend not in raw_origins and "*" not in raw_origins:
+    raw_origins.append(production_frontend)
+
 if "*" in raw_origins:
     app.add_middleware(
         CORSMiddleware,
@@ -51,6 +57,7 @@ else:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=raw_origins,
+        allow_origin_regex=r"^https://.*\.vercel\.app$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

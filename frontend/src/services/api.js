@@ -3,10 +3,13 @@
  * Centralized service connecting React frontend to the FastAPI RAG backend.
  */
 
-// Read base URL from Vite environment variable (e.g. VITE_API_BASE_URL=http://localhost:8000)
+// Read base URL from Vite environment variable (e.g. VITE_API_BASE_URL=https://multi-pdf-chatbot-documind-ai.onrender.com)
 // If unset or empty, defaults to '/api' which Vite proxies to localhost:8000 during local dev
-const RAW_BASE = import.meta.env.VITE_API_BASE_URL || '';
-const API_BASE = RAW_BASE ? `${RAW_BASE.replace(/\/+$/, '')}/api` : '/api';
+const RAW_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim();
+const cleanBase = RAW_BASE.replace(/\/+$/, '');
+export const API_BASE = cleanBase
+  ? (cleanBase.endsWith('/api') ? cleanBase : `${cleanBase}/api`)
+  : '/api';
 
 function parseErrorMessage(data, fallback) {
   if (!data) return fallback;
@@ -19,14 +22,26 @@ function parseErrorMessage(data, fallback) {
   return fallback;
 }
 
+async function parseResponse(res, fallbackError) {
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (_) {
+    // Non-JSON response (e.g. HTML 502/504 gateway error or empty)
+  }
+  if (!res.ok) {
+    throw new Error(parseErrorMessage(data, fallbackError || `Server request failed with status ${res.status}`));
+  }
+  return data;
+}
+
 export const apiService = {
   /**
    * Health check
    */
   async getHealth() {
     const res = await fetch(`${API_BASE}/health`);
-    if (!res.ok) throw new Error('Backend server is unreachable');
-    return res.json();
+    return parseResponse(res, 'Backend server is unreachable');
   },
 
   /**
@@ -34,8 +49,7 @@ export const apiService = {
    */
   async getStatus() {
     const res = await fetch(`${API_BASE}/status`);
-    if (!res.ok) throw new Error('Failed to retrieve system status');
-    return res.json();
+    return parseResponse(res, 'Failed to retrieve system status');
   },
 
   /**
@@ -43,8 +57,7 @@ export const apiService = {
    */
   async getDocuments() {
     const res = await fetch(`${API_BASE}/documents`);
-    if (!res.ok) throw new Error('Failed to retrieve document list');
-    return res.json();
+    return parseResponse(res, 'Failed to retrieve document list');
   },
 
   /**
@@ -54,11 +67,7 @@ export const apiService = {
     const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(filename)}`, {
       method: 'DELETE',
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(parseErrorMessage(data, `Failed to remove '${filename}'`));
-    }
-    return data;
+    return parseResponse(res, `Failed to remove '${filename}'`);
   },
 
   /**
@@ -75,11 +84,7 @@ export const apiService = {
       body: formData,
     });
 
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(parseErrorMessage(data, 'Failed to process PDFs'));
-    }
-    return data;
+    return parseResponse(res, 'Failed to process PDFs');
   },
 
   /**
@@ -96,11 +101,7 @@ export const apiService = {
       }),
     });
 
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(parseErrorMessage(data, 'Error generating answer'));
-    }
-    return data;
+    return parseResponse(res, 'Error generating answer');
   },
 
   /**
@@ -116,11 +117,7 @@ export const apiService = {
       }),
     });
 
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(parseErrorMessage(data, 'Failed to generate summary'));
-    }
-    return data;
+    return parseResponse(res, 'Failed to generate summary');
   },
 
   /**
@@ -133,11 +130,7 @@ export const apiService = {
       body: JSON.stringify({ filenames }),
     });
 
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(parseErrorMessage(data, 'Failed to generate comparison'));
-    }
-    return data;
+    return parseResponse(res, 'Failed to generate comparison');
   },
 
   /**
@@ -153,11 +146,7 @@ export const apiService = {
       }),
     });
 
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(parseErrorMessage(data, 'Failed to generate study materials'));
-    }
-    return data;
+    return parseResponse(res, 'Failed to generate study materials');
   },
 
   /**
@@ -174,7 +163,7 @@ export const apiService = {
         comment,
       }),
     });
-    return res.json();
+    return parseResponse(res, 'Failed to submit feedback');
   },
 
   /**
@@ -182,8 +171,7 @@ export const apiService = {
    */
   async getHistory(sessionId = 'default') {
     const res = await fetch(`${API_BASE}/history?session_id=${encodeURIComponent(sessionId)}`);
-    if (!res.ok) throw new Error('Failed to fetch chat history');
-    return res.json();
+    return parseResponse(res, 'Failed to fetch chat history');
   },
 
   /**
@@ -193,8 +181,7 @@ export const apiService = {
     const res = await fetch(`${API_BASE}/history/clear?session_id=${encodeURIComponent(sessionId)}`, {
       method: 'POST',
     });
-    if (!res.ok) throw new Error('Failed to clear conversation history');
-    return res.json();
+    return parseResponse(res, 'Failed to clear conversation history');
   },
 
   /**
@@ -202,7 +189,6 @@ export const apiService = {
    */
   async clearAll() {
     const res = await fetch(`${API_BASE}/clear`, { method: 'POST' });
-    if (!res.ok) throw new Error('Failed to reset knowledge base');
-    return res.json();
+    return parseResponse(res, 'Failed to reset knowledge base');
   },
 };

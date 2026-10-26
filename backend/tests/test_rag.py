@@ -245,9 +245,43 @@ def test_upload_invalid_pdf_magic_header():
 
 def test_cors_configuration_parsing():
     from app.config import settings
-    origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+    origins = [o.strip().rstrip("/") for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
     assert len(origins) >= 1
     assert any("localhost" in o for o in origins)
+    assert any("multi-pdf-chatbot-docu-mind-ai.vercel.app" in o for o in origins)
+
+def test_cors_headers_and_preflight_on_api():
+    origin = "https://multi-pdf-chatbot-docu-mind-ai.vercel.app"
+    # GET status with Origin header
+    res = client.get("/api/status", headers={"Origin": origin})
+    assert res.status_code == 200
+    assert res.headers.get("access-control-allow-origin") == origin
+    assert res.headers.get("access-control-allow-credentials") == "true"
+
+    # OPTIONS preflight on /api/upload
+    res_opt = client.options(
+        "/api/upload",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        }
+    )
+    assert res_opt.status_code == 200
+    assert res_opt.headers.get("access-control-allow-origin") == origin
+
+    # OPTIONS preflight on preview vercel deployment URL (matched by regex)
+    preview_origin = "https://multi-pdf-chatbot-git-preview-branch.vercel.app"
+    res_preview = client.options(
+        "/api/chat",
+        headers={
+            "Origin": preview_origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        }
+    )
+    assert res_preview.status_code == 200
+    assert res_preview.headers.get("access-control-allow-origin") == preview_origin
 
 def test_classify_gemini_error():
     from app.rag_engine import classify_gemini_error

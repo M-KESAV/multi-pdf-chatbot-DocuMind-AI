@@ -16,12 +16,18 @@ export const App = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const sessionId = 'default';
 
-  const refreshStatus = async () => {
+  const refreshStatus = async (retryIfFailed = false) => {
     try {
       const data = await apiService.getStatus();
       setSystemStatus(data);
+      return data;
     } catch (err) {
       console.error('Failed to load status:', err);
+      if (retryIfFailed) {
+        // Cold-start retry for hosted instances spinning up from sleep
+        setTimeout(() => refreshStatus(false), 4000);
+      }
+      return null;
     }
   };
 
@@ -37,7 +43,7 @@ export const App = () => {
   };
 
   useEffect(() => {
-    refreshStatus();
+    refreshStatus(true);
     loadHistory();
   }, []);
 
