@@ -39,6 +39,52 @@ class GeminiModelConfigError(Exception):
     """Raised when Gemini model configuration is invalid or unsupported."""
     pass
 
+def parse_retry_after(err: Exception) -> Optional[float]:
+    """
+    Extracts Retry-After duration in seconds from HTTP headers or error strings.
+    Handles 'Retry-After' headers, and messages like 'retry in 35.5s', 'retry after 30 seconds', etc.
+    """
+    # 1. Check HTTP response object if attached
+    resp = getattr(err, "response", None)
+    if resp is not None and hasattr(resp, "headers"):
+        hdr = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+        if hdr:
+            try:
+                val = float(hdr)
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+
+    # 2. Check retry_after attribute directly on exception
+    if hasattr(err, "retry_after") and isinstance(getattr(err, "retry_after"), (int, float)):
+        val = float(getattr(err, "retry_after"))
+        if val > 0:
+            return val
+
+    err_str = str(err).lower()
+
+    # 3. Comprehensive regex patterns
+    patterns = [
+        r'retry in\s+([\d\.]+)\s*s',
+        r'retry[- ]after[:\s]+([\d\.]+)',
+        r'wait\s+([\d\.]+)\s*s',
+        r'please retry in\s+([\d\.]+)\s*second',
+        r'please retry after\s+([\d\.]+)\s*second',
+        r'try again after\s+([\d\.]+)\s*second',
+        r'after\s+([\d\.]+)\s*s',
+    ]
+    for pat in patterns:
+        m = re.search(pat, err_str)
+        if m:
+            try:
+                val = float(m.group(1))
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+    return None
+
 def classify_gemini_error(err: Exception) -> Dict[str, Any]:
     """
     Classifies a Gemini API exception into granular categories:
@@ -100,16 +146,7 @@ def classify_gemini_error(err: Exception) -> Dict[str, Any]:
         or "requests per minute" in full_repr
     )
     if is_429:
-        retry_seconds = None
-        match = re.search(r'retry in\s+([\d\.]+)\s*s', err_str)
-        if not match:
-            match = re.search(r'retry[- ]after[:\s]+(\d+)', err_str)
-        if match:
-            try:
-                retry_seconds = float(match.group(1))
-            except ValueError:
-                pass
-
+        retry_seconds = parse_retry_after(err)
         return {
             "type": "rpm_rate_limit",
             "is_transient": True,
@@ -147,18 +184,78 @@ def is_dense_reference_chunk(text: str) -> bool:
         return True
     return False
 
+class GeminiRateLimiter:
+    """
+    Enforces that embedding requests do not exceed the configured Gemini RPM limit.
+    For 15 RPM, minimum interval is 60.0 / 15 = 4.0s (plus safety margin = 4.25s).
+    """
+    def __init__(self, rpm: int = 15, safety_margin: float = 0.25):
+        self.rpm = rpm
+        self.safety_margin = safety_margin
+        self._calculate_interval()
+        self.last_request_time = 0.0
+        self._lock = threading.Lock()
+
+    def _calculate_interval(self):
+        if self.rpm > 0:
+            self.min_interval = (60.0 / self.rpm) + self.safety_margin
+        else:
+            self.min_interval = 0.0
+
+    def update_rpm(self, rpm: int, safety_margin: float = 0.25):
+        with self._lock:
+            self.rpm = rpm
+            self.safety_margin = safety_margin
+            self._calculate_interval()
+
+    def wait_for_slot(self) -> float:
+        """Paces calls to stay strictly below RPM limit. Returns seconds slept."""
+        if self.min_interval <= 0:
+            return 0.0
+        with self._lock:
+            now = time.time()
+            elapsed = now - self.last_request_time
+            sleep_needed = self.min_interval - elapsed
+            if sleep_needed > 0:
+                time.sleep(sleep_needed)
+            self.last_request_time = time.time()
+            return max(0.0, sleep_needed)
+
 class RAGEngine:
     def __init__(self):
         self._index_lock = threading.Lock()
+        self.rate_limiter = GeminiRateLimiter(rpm=settings.GEMINI_RPM_LIMIT)
         self._vector_store: Optional[FAISS] = None
         # Track detailed document metadata: filename -> {pages, chunks, size_bytes, uploaded_at, content_hash, raw_docs}
         self._document_store: Dict[str, Dict[str, Any]] = {}
+        # In-memory chunk vector cache to preserve completed batches across retries and failures
+        self._chunk_vector_cache: Dict[str, List[float]] = {}
+        self._cache_file = settings.STORAGE_DIR / "chunk_vector_cache.json"
         # In-memory session history: session_id -> List[Dict[str, Any]]
         self._chat_histories: Dict[str, List[Dict[str, Any]]] = {}
         # Feedback storage for quality tracking
         self._feedback_store: List[Dict[str, Any]] = []
-        # Try loading pre-existing index if available
+        # Try loading pre-existing index & cache if available
+        self._load_chunk_cache()
         self._try_load_existing_index()
+
+    def _load_chunk_cache(self):
+        """Loads cached chunk embeddings from disk if present."""
+        if self._cache_file.exists():
+            try:
+                with open(self._cache_file, "r", encoding="utf-8") as f:
+                    self._chunk_vector_cache = json.load(f)
+            except Exception:
+                self._chunk_vector_cache = {}
+
+    def _save_chunk_cache(self):
+        """Persists chunk embeddings to disk so prior work is never lost."""
+        try:
+            settings.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(self._cache_file, "w", encoding="utf-8") as f:
+                json.dump(self._chunk_vector_cache, f)
+        except Exception:
+            pass
 
     def _get_embeddings(self):
         """Initializes Google Gemini Embeddings."""
@@ -284,27 +381,42 @@ class RAGEngine:
 
     def _safe_batch_embed(self, embeddings, texts: List[str]) -> List[List[float]]:
         """
-        Safely embeds texts in batches with rate-limit throttling and exponential backoff.
-        Fails fast on daily quota exhaustion or auth errors without futile retries.
+        Safely embeds texts in batches with proactive rate limiting (<=15 RPM),
+        exponential backoff with jitter, Retry-After adherence, and chunk-level caching
+        to preserve completed work across retries and failures.
         """
         if not texts:
             return []
 
-        batch_size = max(1, settings.EMBEDDING_BATCH_SIZE)
-        delay_between_batches = max(0.0, settings.EMBEDDING_BATCH_DELAY)
-        max_retries = max(1, settings.EMBEDDING_MAX_RETRIES)
+        # 1. Identify which texts are already in the vector cache
+        text_hashes = [hashlib.sha256(t.encode("utf-8")).hexdigest() for t in texts]
+        missing_indices = [i for i, h in enumerate(text_hashes) if h not in self._chunk_vector_cache]
 
-        all_vectors: List[List[float]] = []
-        total_batches = (len(texts) + batch_size - 1) // batch_size
+        if not missing_indices:
+            print(f"[DocuMind] All {len(texts)} chunk embeddings retrieved from cache (0 API calls).", flush=True)
+            return [self._chunk_vector_cache[h] for h in text_hashes]
+
+        missing_texts = [texts[i] for i in missing_indices]
+        cached_count = len(texts) - len(missing_texts)
+        if cached_count > 0:
+            print(f"[DocuMind] Preserved {cached_count}/{len(texts)} previously computed embeddings. Embedding remaining {len(missing_texts)} chunks...", flush=True)
+
+        batch_size = max(1, settings.EMBEDDING_BATCH_SIZE)
+        max_retries = max(1, settings.EMBEDDING_MAX_RETRIES)
+        total_batches = (len(missing_texts) + batch_size - 1) // batch_size
 
         for batch_idx in range(total_batches):
             start = batch_idx * batch_size
-            batch = texts[start:start + batch_size]
+            batch = missing_texts[start:start + batch_size]
 
             batch_vectors = None
             last_error = None
+            last_wait = 0.0
 
             for attempt in range(max_retries):
+                # Pacing: Ensure we stay safely below the configured 15 RPM
+                self.rate_limiter.wait_for_slot()
+
                 try:
                     batch_vectors = embeddings.embed_documents(batch)
                     break
@@ -312,7 +424,7 @@ class RAGEngine:
                     last_error = e
                     diag = classify_gemini_error(e)
 
-                    # Fail fast immediately on non-transient errors
+                    # Fail fast immediately on non-transient errors (RPD daily quota, auth, model)
                     if diag["type"] == "auth_error":
                         raise GeminiAuthError(diag["message"]) from e
                     elif diag["type"] == "model_error":
@@ -321,15 +433,28 @@ class RAGEngine:
                         raise GeminiDailyQuotaExceededError(diag["message"]) from e
                     elif diag["is_transient"]:
                         if attempt < max_retries - 1:
-                            if diag["retry_after"] is not None and diag["retry_after"] < 35:
-                                sleep_time = diag["retry_after"] + random.uniform(0.5, 1.5)
+                            if diag["retry_after"] is not None and diag["retry_after"] > 0:
+                                sleep_time = min(settings.EMBEDDING_MAX_BACKOFF, diag["retry_after"] + random.uniform(0.5, 1.5))
                             else:
-                                sleep_time = (2 ** attempt) * 1.5 + random.uniform(0.2, 0.8)
+                                sleep_time = min(
+                                    settings.EMBEDDING_MAX_BACKOFF,
+                                    (settings.EMBEDDING_BASE_BACKOFF * (2 ** attempt)) + random.uniform(0.5, 1.5)
+                                )
+                            last_wait = sleep_time
+                            print(
+                                f"[DocuMind RateLimit] Batch {batch_idx + 1}/{total_batches}: HTTP 429 rate limit. "
+                                f"Waiting {sleep_time:.1f}s before retry (attempt {attempt + 1}/{max_retries})...",
+                                flush=True
+                            )
                             time.sleep(sleep_time)
                             continue
                         else:
+                            completed_count = cached_count + (batch_idx * batch_size)
                             raise GeminiRateLimitError(
-                                f"{diag['message']} (Failed on batch {batch_idx + 1}/{total_batches} after {max_retries} attempts)."
+                                f"Google Gemini Embedding API rate limit (HTTP 429) exceeded on batch {batch_idx + 1}/{total_batches} "
+                                f"after {max_retries} attempts (last wait: {last_wait:.1f}s). "
+                                f"Successfully completed and preserved {completed_count}/{len(texts)} chunks. "
+                                "Please wait 30–60 seconds before retrying—only remaining uncompleted batches will be processed."
                             ) from e
                     else:
                         raise e
@@ -339,13 +464,17 @@ class RAGEngine:
                     f"Failed to generate embeddings after {max_retries} attempts: {last_error}"
                 )
 
-            all_vectors.extend(batch_vectors)
+            # Immediately cache this batch of vectors on disk and in memory
+            for t, vec in zip(batch, batch_vectors):
+                th = hashlib.sha256(t.encode("utf-8")).hexdigest()
+                self._chunk_vector_cache[th] = vec
+            self._save_chunk_cache()
 
-            # Delay between batches to prevent burst spikes
-            if batch_idx < total_batches - 1 and delay_between_batches > 0:
-                time.sleep(delay_between_batches)
+            # Delay between batches if configured
+            if batch_idx < total_batches - 1 and settings.EMBEDDING_BATCH_DELAY > 0:
+                time.sleep(min(1.0, settings.EMBEDDING_BATCH_DELAY))
 
-        return all_vectors
+        return [self._chunk_vector_cache[h] for h in text_hashes]
 
     def process_and_index_pdfs(self, pdf_files: List[Tuple[str, bytes]]) -> Dict[str, Any]:
         """
@@ -528,6 +657,7 @@ class RAGEngine:
 
         with self._index_lock:
             for attempt in range(max_retries):
+                self.rate_limiter.wait_for_slot()
                 try:
                     raw_results = self._vector_store.similarity_search_with_score(question, k=candidate_k)
                     break
@@ -536,12 +666,20 @@ class RAGEngine:
                     if diag["type"] == "rpd_exhausted":
                         raise GeminiDailyQuotaExceededError(diag["message"]) from e
                     elif diag["is_transient"] and attempt < max_retries - 1:
-                        time.sleep((2 ** attempt) * 1.5 + random.uniform(0.1, 0.4))
+                        if diag["retry_after"] is not None and diag["retry_after"] > 0:
+                            sleep_time = min(settings.EMBEDDING_MAX_BACKOFF, diag["retry_after"] + random.uniform(0.5, 1.5))
+                        else:
+                            sleep_time = min(
+                                settings.EMBEDDING_MAX_BACKOFF,
+                                (settings.EMBEDDING_BASE_BACKOFF * (2 ** attempt)) + random.uniform(0.2, 0.5)
+                            )
+                        print(f"[DocuMind RateLimit] Query search 429 rate limit. Waiting {sleep_time:.1f}s before retry (attempt {attempt + 1}/{max_retries})...", flush=True)
+                        time.sleep(sleep_time)
                         continue
                     elif diag["is_transient"]:
                         raise GeminiRateLimitError(
                             "Google Gemini Embedding API quota exceeded (HTTP 429 RESOURCE_EXHAUSTED) during query search. "
-                            "Please wait 60 seconds before trying again."
+                            "Please wait 30–60 seconds before trying again."
                         ) from e
                     else:
                         raise e
@@ -946,12 +1084,18 @@ Output JSON only:"""
                 self._chat_histories[session_id] = []
 
     def clear(self, session_id: Optional[str] = None):
-        """Clears index and history completely."""
+        """Clears index, cache, and history completely."""
         with self._index_lock:
             if session_id and session_id != "all":
                 self._chat_histories.pop(session_id, None)
             else:
                 self._chat_histories.clear()
+                self._chunk_vector_cache.clear()
+                if self._cache_file.exists():
+                    try:
+                        self._cache_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
             self._vector_store = None
             self._document_store.clear()
             if settings.FAISS_INDEX_DIR.exists():

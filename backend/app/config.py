@@ -25,8 +25,11 @@ class Settings(BaseSettings):
 
     # Embedding Throttling & Rate Limit Resilience
     EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
-    EMBEDDING_BATCH_DELAY: float = float(os.getenv("EMBEDDING_BATCH_DELAY", "0.6"))
-    EMBEDDING_MAX_RETRIES: int = int(os.getenv("EMBEDDING_MAX_RETRIES", "3"))
+    EMBEDDING_BATCH_DELAY: float = float(os.getenv("EMBEDDING_BATCH_DELAY", "4.25"))
+    EMBEDDING_MAX_RETRIES: int = int(os.getenv("EMBEDDING_MAX_RETRIES", "4"))
+    GEMINI_RPM_LIMIT: int = int(os.getenv("GEMINI_RPM_LIMIT", "15"))
+    EMBEDDING_BASE_BACKOFF: float = float(os.getenv("EMBEDDING_BASE_BACKOFF", "2.0"))
+    EMBEDDING_MAX_BACKOFF: float = float(os.getenv("EMBEDDING_MAX_BACKOFF", "60.0"))
 
     # Server & Security
     HOST: str = os.getenv("HOST", "0.0.0.0")

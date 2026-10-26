@@ -365,6 +365,128 @@ def test_path_traversal_sanitization():
     finally:
         rag_engine._safe_batch_embed = orig_embed
 
+def test_parse_retry_after():
+    from app.rag_engine import parse_retry_after
+
+    # 1. From error string 'retry in 35.5s'
+    err1 = Exception("ResourceExhausted: rate limit reached. Please retry in 35.5s")
+    assert parse_retry_after(err1) == 35.5
+
+    # 2. From error string 'Retry-After: 42'
+    err2 = Exception("HTTP 429: Too Many Requests. Retry-After: 42")
+    assert parse_retry_after(err2) == 42.0
+
+    # 3. From error string 'please retry after 25 seconds'
+    err3 = Exception("429 Too many requests, please retry after 25 seconds")
+    assert parse_retry_after(err3) == 25.0
+
+    # 4. From mock HTTP response header
+    from unittest.mock import MagicMock
+    err4 = Exception("Rate limit")
+    mock_resp = MagicMock()
+    mock_resp.headers = {"retry-after": "18.5"}
+    err4.response = mock_resp
+    assert parse_retry_after(err4) == 18.5
+
+    # 5. When no Retry-After is available
+    err5 = Exception("Generic connection failure")
+    assert parse_retry_after(err5) is None
+
+def test_gemini_rate_limiter_pacing():
+    import time
+    from app.rag_engine import GeminiRateLimiter
+
+    # Use a high RPM for quick test (e.g. 600 RPM = 0.1s interval)
+    limiter = GeminiRateLimiter(rpm=600, safety_margin=0.0)
+    assert limiter.min_interval == 0.1
+
+    t0 = time.time()
+    limiter.wait_for_slot()
+    limiter.wait_for_slot()
+    elapsed = time.time() - t0
+    # The second call must have paced at least ~0.08s
+    assert elapsed >= 0.08
+
+def test_preserve_completed_batches_across_retries():
+    from unittest.mock import MagicMock
+    from app.rag_engine import GeminiRateLimitError
+    import hashlib
+
+    # Create 4 sample chunks
+    chunks = [f"Text chunk number {i} for caching test" for i in range(4)]
+    
+    # Configure batch size = 2, so chunks 0-1 are batch 1, chunks 2-3 are batch 2
+    from app.config import settings
+    orig_batch_size = settings.EMBEDDING_BATCH_SIZE
+    orig_base_backoff = settings.EMBEDDING_BASE_BACKOFF
+    settings.EMBEDDING_BATCH_SIZE = 2
+    settings.EMBEDDING_BASE_BACKOFF = 0.01
+
+    # Clean cache for this test
+    orig_cache = rag_engine._chunk_vector_cache.copy()
+    rag_engine._chunk_vector_cache.clear()
+
+    mock_embeddings = MagicMock()
+    # Batch 1 succeeds, Batch 2 fails with 429
+    call_tracker = []
+    def embed_side_effect(batch):
+        call_tracker.append(batch)
+        if len(call_tracker) == 1:
+            return [[0.1, 0.1], [0.2, 0.2]]
+        raise Exception("429 RESOURCE_EXHAUSTED: Queries per minute limit reached. retry in 0.01s")
+
+    mock_embeddings.embed_documents.side_effect = embed_side_effect
+
+    try:
+        # First attempt: Batch 1 succeeds, Batch 2 fails after retries
+        with pytest.raises(GeminiRateLimitError) as exc_info:
+            rag_engine._safe_batch_embed(mock_embeddings, chunks)
+
+        assert "preserved 2/4 chunks" in str(exc_info.value).lower()
+
+        # Verify batch 1 chunks are now in cache
+        h0 = hashlib.sha256(chunks[0].encode("utf-8")).hexdigest()
+        h1 = hashlib.sha256(chunks[1].encode("utf-8")).hexdigest()
+        assert h0 in rag_engine._chunk_vector_cache
+        assert h1 in rag_engine._chunk_vector_cache
+
+        # Second attempt (after user waits and retries):
+        # Reset mock call count and verify only the remaining batch 2 is called
+        call_tracker.clear()
+        mock_embeddings.reset_mock()
+        mock_embeddings.embed_documents.side_effect = lambda b: (call_tracker.append(b), [[0.3, 0.3], [0.4, 0.4]])[1]
+
+        vectors = rag_engine._safe_batch_embed(mock_embeddings, chunks)
+        assert len(vectors) == 4
+        # Verify that embed_documents was ONLY called for the remaining 2 chunks (batch 2)!
+        assert mock_embeddings.embed_documents.call_count == 1
+        assert len(call_tracker[0]) == 2
+        assert call_tracker[0] == chunks[2:4]
+    finally:
+        settings.EMBEDDING_BATCH_SIZE = orig_batch_size
+        settings.EMBEDDING_BASE_BACKOFF = orig_base_backoff
+        rag_engine._chunk_vector_cache = orig_cache
+
+def test_progress_message_and_helpful_error_when_retries_exhausted(capsys):
+    from unittest.mock import MagicMock
+    from app.rag_engine import GeminiRateLimitError
+
+    mock_embeddings = MagicMock()
+    mock_embeddings.embed_documents.side_effect = Exception("429 RESOURCE_EXHAUSTED: rate limit exceeded. retry in 0.01s")
+
+    with pytest.raises(GeminiRateLimitError) as exc_info:
+        rag_engine._safe_batch_embed(mock_embeddings, ["Uncached chunk test"])
+
+    # Check progress output in stdout
+    captured = capsys.readouterr()
+    assert "DocuMind RateLimit" in captured.out
+    assert "Waiting" in captured.out
+
+    # Check error message helpfulness
+    err_msg = str(exc_info.value)
+    assert "exceeded on batch 1/1" in err_msg
+    assert "Please wait 30–60 seconds before retrying" in err_msg
+
 
 
 

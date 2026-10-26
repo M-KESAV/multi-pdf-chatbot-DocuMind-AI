@@ -1,0 +1,12 @@
+{
+  "name": "multi-pdf-chatbot",
+  "private": true,
+  "version": "2.0.0",
+  "description": "DocuMind AI — Enterprise Multi-PDF Document Intelligence Workspace",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "preview": "npm --prefix frontend run preview",
+    "install:frontend": "npm --prefix frontend install"
+  }
+}
