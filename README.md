@@ -4,6 +4,8 @@ DocuMind AI is a full-stack, enterprise-grade Retrieval-Augmented Generation (RA
 
 Built with a high-performance **FastAPI** backend and a **React.js + Vite** single-page application, featuring a clean, premium **white/light theme** with high-contrast typography, subtle glassmorphic elevation, and curated brand accents (**Plus Jakarta Sans**, **Inter**, and royal violet/cyan accents).
 
+
+https://multi-pdf-chatbot-docu-mind-ai.vercel.app/
 ---
 
 ## 🌟 Key Features
