@@ -1,0 +1,44 @@
+# Environment variables & secrets
+.env
+*.env
+backend/.env
+frontend/.env
+frontend/.env.local
+.env*.local
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
+
+# Vector storage & user uploads
+backend/storage/
+backend/storage/faiss_index/
+sample_pdfs/
+*.pdf
+
+# Node & Frontend build
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.vite/
+frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / Editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+scratch/
